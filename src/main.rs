@@ -1,20 +1,25 @@
-// use vulkano::pipeline::GraphicsPipelineAbstract;
+use cgmath::Deg;
+use cgmath::Matrix4;
+use cgmath::Point3;
+use cgmath::Rad;
+use cgmath::Vector3;
 use std::collections::HashSet;
-use std::ffi::CString;
 use std::iter::FromIterator;
-use std::ops::Deref;
 use std::sync::Arc;
-use vulkano::SynchronizedVulkanObject;
-use vulkano::VulkanObject;
+use std::time::Instant;
+use vulkano::buffer::BufferAccess;
+use vulkano::buffer::BufferUsage;
+use vulkano::buffer::CpuAccessibleBuffer;
+use vulkano::buffer::TypedBufferAccess;
+use vulkano::buffer::immutable::ImmutableBuffer;
 use vulkano::command_buffer::AutoCommandBuffer;
 use vulkano::command_buffer::AutoCommandBufferBuilder;
 use vulkano::command_buffer::DynamicState;
-use vulkano::descriptor::PipelineLayoutAbstract;
+use vulkano::descriptor::descriptor_set::PersistentDescriptorSet;
 use vulkano::device::Device;
 use vulkano::device::DeviceExtensions;
 use vulkano::device::Features;
 use vulkano::device::Queue;
-use vulkano::device::RawDeviceExtensions;
 use vulkano::format::Format;
 use vulkano::framebuffer::Framebuffer;
 use vulkano::framebuffer::FramebufferAbstract;
@@ -22,18 +27,16 @@ use vulkano::framebuffer::RenderPassAbstract;
 use vulkano::framebuffer::Subpass;
 use vulkano::image::ImageUsage;
 use vulkano::image::swapchain::SwapchainImage;
-use vulkano::image::traits::ImageAccess;
+use vulkano::impl_vertex;
 use vulkano::instance::ApplicationInfo;
 use vulkano::instance::Instance;
-use vulkano::instance::InstanceExtensions;
 use vulkano::instance::PhysicalDevice;
 use vulkano::instance::RawInstanceExtensions;
 use vulkano::instance::Version;
 use vulkano::instance::debug::DebugCallback;
 use vulkano::instance::debug::MessageTypes;
 use vulkano::pipeline::GraphicsPipeline;
-use vulkano::pipeline::vertex::BufferlessDefinition;
-use vulkano::pipeline::vertex::BufferlessVertices;
+use vulkano::pipeline::GraphicsPipelineAbstract;
 use vulkano::pipeline::viewport::Viewport;
 use vulkano::swapchain::AcquireError;
 use vulkano::swapchain::Capabilities;
@@ -48,15 +51,15 @@ use vulkano::sync::SharingMode;
 use vulkano_win::VkSurfaceBuild;
 use winit::Event;
 use winit::EventsLoop;
+use winit::VirtualKeyCode;
 use winit::Window;
 use winit::WindowBuilder;
 use winit::WindowEvent;
 use winit::dpi::LogicalSize;
 use winit::os::unix::WindowBuilderExt;
-use { openvr, vulkano, vulkano_win };
 
-mod vertex_shader;
-mod fragment_shader;
+// mod vertex_shader;
+// mod fragment_shader;
 
 const WIDTH:  u32 = 800;
 const HEIGHT: u32 = 600;
@@ -71,25 +74,47 @@ const ENABLE_VALIDATION_LAYERS: bool = true;
 const ENABLE_VALIDATION_LAYERS: bool = false;
 
 /// Required device extensions
-fn device_extensions() -> RawDeviceExtensions {
-    let extensions = DeviceExtensions {
+fn device_extensions() -> DeviceExtensions {
+    DeviceExtensions {
         khr_swapchain: true,
         ..vulkano::device::DeviceExtensions::none()
-    };
-
-    let mut extensions: RawDeviceExtensions = (&extensions).into();
-    for n in vec![
-        "VK_KHR_external_memory_fd",
-        "VK_KHR_external_semaphore_fd",
-        "VK_KHR_external_memory",
-        "VK_KHR_external_semaphore",
-        "VK_KHR_dedicated_allocation",
-        "VK_KHR_get_memory_requirements2"
-    ] {
-        extensions.insert(CString::new(n).unwrap());
     }
+}
 
-    extensions
+#[derive(Copy, Clone)]
+struct Vertex {
+    pos:   [f32; 2],
+    color: [f32; 3],
+}
+
+impl_vertex!(Vertex, pos, color);
+impl Vertex {
+    fn new(pos: [f32; 2], color: [f32; 3]) -> Self {
+        Self {
+            pos, color,
+        }
+    }
+}
+
+fn vertices() -> [Vertex; 4] {
+    [
+        Vertex::new([ -0.5, -0.5 ], [ 1.0, 0.0, 1.0 ]),
+        Vertex::new([  0.5, -0.5 ], [ 1.0, 1.0, 1.0 ]),
+        Vertex::new([  0.5,  0.5 ], [ 0.0, 1.0, 0.0 ]),
+        Vertex::new([ -0.5,  0.5 ], [ 0.0, 0.0, 1.0 ]),
+    ]
+}
+
+fn indices() -> [u16; 6] {
+    [ 0, 1, 2, 2, 3, 0 ]
+}
+
+#[allow(dead_code)]
+#[derive(Copy, Clone)]
+struct UniformBufferObject {
+    model: Matrix4<f32>,
+    view:  Matrix4<f32>,
+    proj:  Matrix4<f32>,
 }
 
 struct QueueFamilyIndices {
@@ -111,10 +136,6 @@ impl QueueFamilyIndices {
     }
 }
 
-type ConcreteGraphicsPipeline = GraphicsPipeline<BufferlessDefinition,
-                                                 Box<dyn PipelineLayoutAbstract + Send + Sync + 'static>,
-                                                 Arc<dyn RenderPassAbstract + Send + Sync + 'static>>;
-
 struct HelloTriangleApplication {
     instance: Arc<Instance>,
     debug_callback: Option<DebugCallback>,
@@ -132,23 +153,19 @@ struct HelloTriangleApplication {
     swap_chain_images: Vec<Arc<SwapchainImage<Window>>>,
 
     render_pass: Arc<dyn RenderPassAbstract + Send + Sync>,
-    graphics_pipeline: Arc<ConcreteGraphicsPipeline>,
-    // graphics_pipeline: Arc<dyn GraphicsPipelineAbstract + Send + Sync>,
+    graphics_pipeline: Arc<dyn GraphicsPipelineAbstract + Send + Sync>,
 
     swap_chain_framebuffers: Vec<Arc<dyn FramebufferAbstract + Send + Sync>>,
 
+    vertex_buffer:   Arc<dyn BufferAccess + Send + Sync>,
+    index_buffer:    Arc<dyn TypedBufferAccess<Content=[u16]> + Send + Sync>,
+    uniform_buffers: Vec<Arc<CpuAccessibleBuffer<UniformBufferObject>>>,
     command_buffers: Vec<Arc<AutoCommandBuffer>>,
 
     previous_frame_end: Option<Box<GpuFuture>>,
     recreate_swap_chain: bool,
 
-    vr: VrSubsystem,
-}
-
-struct VrSubsystem {
-    context:    openvr::Context,
-    system:     openvr::System,
-    compositor: openvr::Compositor,
+    start_time: Instant,
 }
 
 impl HelloTriangleApplication {
@@ -161,8 +178,6 @@ impl HelloTriangleApplication {
         let physical_device_index                   = Self::pick_physical_device(&instance, &surface);
         let (device, graphics_queue, present_queue) = Self::create_logical_device(&instance, &surface, physical_device_index);
 
-        let vr = Self::create_vr_context();
-
         let (swap_chain, swap_chain_images) = Self::create_swap_chain(&instance, &surface, physical_device_index,
                                                                       &device, &graphics_queue, &present_queue, None);
 
@@ -170,6 +185,12 @@ impl HelloTriangleApplication {
         let graphics_pipeline = Self::create_graphics_pipeline(&device, swap_chain.dimensions(), &render_pass);
 
         let swap_chain_framebuffers = Self::create_framebuffers(&swap_chain_images, &render_pass);
+
+        let start_time = Instant::now();
+
+        let vertex_buffer   = Self::create_vertex_buffer(&graphics_queue);
+        let index_buffer    = Self::create_index_buffer(&graphics_queue);
+        let uniform_buffers = Self::create_uniform_buffers(&device, swap_chain_images.len(), start_time, swap_chain.dimensions());
 
         let previous_frame_end = Some(Self::create_sync_objects(&device));
 
@@ -194,29 +215,20 @@ impl HelloTriangleApplication {
 
             swap_chain_framebuffers,
 
+            vertex_buffer,
+            index_buffer,
+            uniform_buffers,
             command_buffers: vec![],
 
             previous_frame_end,
             recreate_swap_chain: false,
 
-            vr,
+            start_time,
         };
 
         app.create_command_buffers();
 
         app
-    }
-
-    fn create_vr_context() -> VrSubsystem {
-        let context    = unsafe { openvr::init(openvr::ApplicationType::Scene).expect("openvr context") };
-        let system     = context.system().expect("openvr system");
-        let compositor = context.compositor().expect("openvr compositor");
-
-        VrSubsystem {
-            context,
-            system,
-            compositor,
-        }
     }
 
     fn create_instance() -> Arc<Instance> {
@@ -262,15 +274,7 @@ impl HelloTriangleApplication {
             extensions.ext_debug_report = true;
         }
 
-        let mut extensions: RawInstanceExtensions = (&extensions).into();
-        for n in vec![
-            "VK_KHR_external_memory_capabilities",
-            "VK_KHR_external_semaphore_capabilities",
-            "VK_KHR_get_physical_device_properties2",
-        ] {
-            extensions.insert(CString::new(n).unwrap());
-        }
-
+        let extensions: RawInstanceExtensions = (&extensions).into();
         extensions
     }
 
@@ -328,7 +332,7 @@ impl HelloTriangleApplication {
     }
 
     fn check_device_extension_support(device: &PhysicalDevice) -> bool {
-        let available_extensions = RawDeviceExtensions::supported_by_device(*device);
+        let available_extensions = DeviceExtensions::supported_by_device(*device);
         let device_extensions = device_extensions();
 
         available_extensions.intersection(&device_extensions) == device_extensions
@@ -373,7 +377,7 @@ impl HelloTriangleApplication {
         let (device, mut queues) = Device::new(
             physical_device,
             &Features::none(),
-            device_extensions(),
+            &device_extensions(),
             queue_families
         )
         .expect("logical device");
@@ -408,7 +412,7 @@ impl HelloTriangleApplication {
         if let Some(current_extent) = capabilities.current_extent {
             current_extent
         } else {
-            let mut actual_extent = [WIDTH, HEIGHT];
+            let mut actual_extent = [ WIDTH, HEIGHT ];
             actual_extent[0] = capabilities.min_image_extent[0]
                           .max(capabilities.max_image_extent[0].min(actual_extent[0]));
             actual_extent[1] = capabilities.min_image_extent[1]
@@ -440,7 +444,6 @@ impl HelloTriangleApplication {
 
         let image_usage = ImageUsage {
             color_attachment: true,
-            transfer_source: true,
             ..ImageUsage::none()
         };
 
@@ -510,8 +513,21 @@ impl HelloTriangleApplication {
         device: &Arc<Device>,
         swap_chain_extent: [u32; 2],
         render_pass: &Arc<dyn RenderPassAbstract + Send + Sync>,
-    // ) -> Arc<dyn GraphicsPipelineAbstract + Send + Sync> {
-    ) -> Arc<ConcreteGraphicsPipeline> {
+    ) -> Arc<dyn GraphicsPipelineAbstract + Send + Sync> {
+        mod vertex_shader {
+            vulkano_shaders::shader! {
+               ty: "vertex",
+               path: "src/shader.vert",
+            }
+        }
+
+        mod fragment_shader {
+            vulkano_shaders::shader! {
+                ty: "fragment",
+                path: "src/shader.frag",
+            }
+        }
+
         let vert_shader_module = vertex_shader::Shader::load(device.clone()).expect("vertex shader module");
         let frag_shader_module = fragment_shader::Shader::load(device.clone()).expect("fragment shader module");
 
@@ -523,7 +539,7 @@ impl HelloTriangleApplication {
         };
 
         Arc::new(GraphicsPipeline::start()
-            .vertex_input(BufferlessDefinition {})
+            .vertex_input_single_buffer::<Vertex>()
             .vertex_shader(vert_shader_module.main_entry_point(), ())
             .triangle_list()
             .primitive_restart(false)
@@ -533,7 +549,7 @@ impl HelloTriangleApplication {
             // NOTE: there's an outcommented .rasterizer_discard() in Vulkano...
             .polygon_mode_fill()
             .line_width(1.0)
-            .cull_mode_back()
+            // .cull_mode_back()
             .front_face_clockwise()
             // NOTE: no depth_bias here, but on pipeline::raster::Rasterization
             .blend_pass_through()
@@ -555,16 +571,102 @@ impl HelloTriangleApplication {
             .collect::<Vec<_>>()
     }
 
+    fn create_vertex_buffer(graphics_queue: &Arc<Queue>) -> Arc<dyn BufferAccess + Send + Sync> {
+        // CpuAccessibleBuffer::from_iter(device.clone(), BufferUsage::vertex_buffer(), vertices().iter().cloned()).unwrap()
+
+        let (buffer, future) = ImmutableBuffer::from_iter(
+                vertices().iter().cloned(), BufferUsage::vertex_buffer(),
+                graphics_queue.clone())
+            .unwrap();
+
+        future.flush().unwrap();
+
+        buffer
+    }
+
+    fn create_index_buffer(graphics_queue: &Arc<Queue>) -> Arc<dyn TypedBufferAccess<Content=[u16]> + Send + Sync> {
+        let (buffer, future) = ImmutableBuffer::from_iter(
+                indices().iter().cloned(), BufferUsage::index_buffer(),
+                graphics_queue.clone())
+            .unwrap();
+
+        future.flush().unwrap();
+
+        buffer
+    }
+
+    fn create_uniform_buffers(
+        device: &Arc<Device>,
+        num_buffers: usize,
+        start_time: Instant,
+        dimensions_u32: [u32; 2],
+    ) -> Vec<Arc<CpuAccessibleBuffer<UniformBufferObject>>> {
+        let mut buffers = Vec::new();
+
+        let dimensions = [ dimensions_u32[0] as f32, dimensions_u32[1] as f32 ];
+
+        let uniform_buffer = Self::update_uniform_buffer(start_time, dimensions);
+
+        for _ in 0..num_buffers {
+            let buffer = CpuAccessibleBuffer::from_data(
+                device.clone(),
+                BufferUsage::uniform_buffer_transfer_destination(),
+                uniform_buffer,
+            ).unwrap();
+
+            buffers.push(buffer);
+        }
+
+        buffers
+    }
+
+    fn update_uniform_buffer(start_time: Instant, dimensions: [f32; 2]) -> UniformBufferObject {
+        let elapsed = start_time.elapsed();
+        let elapsed = (elapsed.as_secs() * 1000) + u64::from(elapsed.subsec_millis());
+
+        let model = Matrix4::from_angle_z(Rad::from(Deg(elapsed as f32 * 0.180)));
+
+        let view = Matrix4::look_at(
+            Point3::new(2.0, 2.0, 2.0),
+            Point3::new(0.0, 0.0, 0.0),
+            Vector3::new(0.0, 0.0, 1.0),
+        );
+
+        let mut proj = cgmath::perspective(
+            Rad::from(Deg(45.0)),
+            dimensions[0] as f32 / dimensions[1] as f32,
+            0.1,
+            10.0,
+        );
+
+        proj.y.y *= -1.0;
+
+        UniformBufferObject {
+            model, view, proj,
+        }
+    }
+
     fn create_command_buffers(&mut self) {
         let queue_family = self.graphics_queue.family();
 
-        self.command_buffers = self.swap_chain_framebuffers.iter()
-            .map(|framebuffer| {
-                let vertices = BufferlessVertices { vertices: 3, instances: 1 };
+        self.command_buffers = self.swap_chain_framebuffers.iter().enumerate()
+            .map(|(idx, framebuffer)| {
+                let set = Arc::new(
+                    PersistentDescriptorSet::start(self.graphics_pipeline.clone(), 0)
+                        .add_buffer(self.uniform_buffers[idx].clone()).unwrap()
+                        .build().unwrap()
+                );
 
                 Arc::new(AutoCommandBufferBuilder::primary_simultaneous_use(self.device.clone(), queue_family).unwrap()
                          .begin_render_pass(framebuffer.clone(), false, vec![ [ 0.0, 0.0, 0.0, 1.0 ].into() ]).unwrap()
-                         .draw(self.graphics_pipeline.clone(), &DynamicState::none(), vertices, (), ()).unwrap()
+                         .draw_indexed(
+                             self.graphics_pipeline.clone(),
+                             &DynamicState::none(),
+                             vec![ self.vertex_buffer.clone() ],
+                             self.index_buffer.clone(),
+                             set.clone(),
+                             (),
+                         ).unwrap()
                          .end_render_pass().unwrap()
                          .build().unwrap())
             })
@@ -580,7 +682,15 @@ impl HelloTriangleApplication {
                     Event::WindowEvent { event: WindowEvent::CloseRequested, .. } => {
                         done = true;
                     },
-                    _ => (),
+                    Event::WindowEvent { event: WindowEvent::KeyboardInput { input, .. }, .. } => {
+                        match input.virtual_keycode {
+                            Some(VirtualKeyCode::Escape) => {
+                                done = true;
+                            },
+                            _ => ()
+                        }
+                    },
+                    _ => ()
                 }
             });
 
@@ -593,9 +703,7 @@ impl HelloTriangleApplication {
     }
 
     fn draw_frame(&mut self) {
-        // self.previous_frame_end.as_mut().unwrap().cleanup_finished();
-
-        let _poses = self.vr.compositor.wait_get_poses().expect("wait_get_poses");
+        self.previous_frame_end.as_mut().unwrap().cleanup_finished();
 
         if self.recreate_swap_chain {
             self.recreate_swap_chain();
@@ -611,36 +719,21 @@ impl HelloTriangleApplication {
             Err(e) => panic!("{:?}", e),
         };
 
+        let elapsed = self.start_time.elapsed();
+        let elapsed = (elapsed.as_secs() * 1000) + u64::from(elapsed.subsec_millis());
+
+        {
+            let buffer = &self.uniform_buffers[image_index];
+            let mut bufobj = buffer.write().unwrap();
+            bufobj.model = Matrix4::from_angle_z(Rad::from(Deg(elapsed as f32 * 0.180)));
+        }
+
         let command_buffer = self.command_buffers[image_index].clone();
 
         let future = acquire_future
             .then_execute(self.graphics_queue.clone(), command_buffer).unwrap()
             .then_swapchain_present(self.present_queue.clone(), self.swap_chain.clone(), image_index)
             .then_signal_fence_and_flush();
-
-        let physical_device = PhysicalDevice::from_index(&self.instance, self.physical_device_index).unwrap();
-
-        let swap_chain_image = &self.swap_chain_images[image_index];
-        let [ width, height ] = swap_chain_image.dimensions().width_height();
-        let format = swap_chain_image.format() as u32;
-        let sample_count = swap_chain_image.samples();
-
-        let eye = openvr::Eye::Left;
-        let handle = openvr::compositor::texture::vulkan::Texture {
-            image: swap_chain_image.inner().image.internal_object(),
-            device: self.device.internal_object() as *mut _,
-            physical_device: physical_device.internal_object() as *mut _,
-            instance: self.instance.internal_object() as *mut _,
-            queue: *self.graphics_queue.internal_object_guard().deref() as *mut _,
-            queue_family_index: self.graphics_queue.id_within_family(),
-            width, height, format, sample_count,
-
-        };
-        let texture = openvr::compositor::texture::Texture {
-            handle:      openvr::compositor::texture::Handle::Vulkan(handle),
-            color_space: openvr::compositor::texture::ColorSpace::Auto,
-        };
-        unsafe { self.vr.compositor.submit(eye, &texture, None, None).expect("submit") };
 
         match future {
             Ok(future) => {
