@@ -3,7 +3,10 @@ use cgmath::Matrix4;
 use cgmath::Point3;
 use cgmath::Rad;
 use cgmath::Vector3;
+use itertools::Itertools;
+use png::HasParameters;
 use std::collections::HashSet;
+use std::fs::File;
 use std::iter::FromIterator;
 use std::sync::Arc;
 use std::time::Instant;
@@ -58,11 +61,8 @@ use winit::WindowEvent;
 use winit::dpi::LogicalSize;
 use winit::os::unix::WindowBuilderExt;
 
-// mod vertex_shader;
-// mod fragment_shader;
-
-const WIDTH:  u32 = 800;
-const HEIGHT: u32 = 600;
+const WIDTH:  u32 = 1280;
+const HEIGHT: u32 = 720;
 
 const VALIDATION_LAYERS: &[&str] = &[
     "VK_LAYER_LUNARG_standard_validation",
@@ -81,15 +81,15 @@ fn device_extensions() -> DeviceExtensions {
     }
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 struct Vertex {
-    pos:   [f32; 2],
+    pos:   [f32; 3],
     color: [f32; 3],
 }
 
 impl_vertex!(Vertex, pos, color);
 impl Vertex {
-    fn new(pos: [f32; 2], color: [f32; 3]) -> Self {
+    fn new(pos: [f32; 3], color: [f32; 3]) -> Self {
         Self {
             pos, color,
         }
@@ -98,19 +98,18 @@ impl Vertex {
 
 fn vertices() -> [Vertex; 4] {
     [
-        Vertex::new([ -0.5, -0.5 ], [ 1.0, 0.0, 1.0 ]),
-        Vertex::new([  0.5, -0.5 ], [ 1.0, 1.0, 1.0 ]),
-        Vertex::new([  0.5,  0.5 ], [ 0.0, 1.0, 0.0 ]),
-        Vertex::new([ -0.5,  0.5 ], [ 0.0, 0.0, 1.0 ]),
+        Vertex::new([ -0.5, -0.5, 0.0 ], [ 0.24, 0.2, 0.0 ]),
+        Vertex::new([  0.5, -0.5, 0.0 ], [ 0.24, 0.2, 0.0 ]),
+        Vertex::new([  0.5,  0.5, 0.0 ], [ 0.24, 0.2, 0.0 ]),
+        Vertex::new([ -0.5,  0.5, 1.0 ], [ 0.24, 0.2, 0.0 ]),
     ]
 }
 
-fn indices() -> [u16; 6] {
-    [ 0, 1, 2, 2, 3, 0 ]
+fn indices() -> [u32; 6] {
+    [ 0, 1, 3, 3, 2, 0 ]
 }
 
-#[allow(dead_code)]
-#[derive(Copy, Clone)]
+#[derive(Clone)]
 struct UniformBufferObject {
     model: Matrix4<f32>,
     view:  Matrix4<f32>,
@@ -138,7 +137,7 @@ impl QueueFamilyIndices {
 
 struct HelloTriangleApplication {
     instance: Arc<Instance>,
-    debug_callback: Option<DebugCallback>,
+    _debug_callback: Option<DebugCallback>,
 
     events_loop: EventsLoop,
     surface: Arc<Surface<Window>>,
@@ -158,20 +157,35 @@ struct HelloTriangleApplication {
     swap_chain_framebuffers: Vec<Arc<dyn FramebufferAbstract + Send + Sync>>,
 
     vertex_buffer:   Arc<dyn BufferAccess + Send + Sync>,
-    index_buffer:    Arc<dyn TypedBufferAccess<Content=[u16]> + Send + Sync>,
+    index_buffer:    Arc<dyn TypedBufferAccess<Content=[u32]> + Send + Sync>,
     uniform_buffers: Vec<Arc<CpuAccessibleBuffer<UniformBufferObject>>>,
     command_buffers: Vec<Arc<AutoCommandBuffer>>,
 
     previous_frame_end: Option<Box<GpuFuture>>,
     recreate_swap_chain: bool,
 
+    state: UniformBufferObject,
     start_time: Instant,
 }
 
 impl HelloTriangleApplication {
     pub fn new() -> Self {
-        let instance       = Self::create_instance();
-        let debug_callback = Self::setup_debug_callback(&instance);
+        let mut decoder = png::Decoder::new(File::open("heightmap.png").expect("heightmap file"));
+        decoder.set(png::Transformations::IDENTITY);
+
+        let (info, mut reader) = decoder.read_info().expect("heightmap format");
+        let mut heightmap      = vec![0; info.buffer_size()];
+        reader.next_frame(&mut heightmap).expect("heightmap data");
+
+        let heightmap = heightmap.chunks(2)
+            .map(|b| u16::from_be_bytes([ b[0], b[1] ]))
+            // .chunks(info.width as usize)
+            // .into_iter()
+            // .map(Iterator::collect)
+            .collect();
+
+        let instance        = Self::create_instance();
+        let _debug_callback = Self::setup_debug_callback(&instance);
 
         let (events_loop, surface) = Self::create_surface(&instance);
 
@@ -186,17 +200,19 @@ impl HelloTriangleApplication {
 
         let swap_chain_framebuffers = Self::create_framebuffers(&swap_chain_images, &render_pass);
 
+        let state = Self::create_state(swap_chain.dimensions());
         let start_time = Instant::now();
 
-        let vertex_buffer   = Self::create_vertex_buffer(&graphics_queue);
-        let index_buffer    = Self::create_index_buffer(&graphics_queue);
-        let uniform_buffers = Self::create_uniform_buffers(&device, swap_chain_images.len(), start_time, swap_chain.dimensions());
+        // let vertex_buffer   = Self::create_vertex_buffer(&graphics_queue);
+        // let index_buffer    = Self::create_index_buffer(&graphics_queue);
+        let (vertex_buffer, index_buffer) = Self::create_terrain(&graphics_queue, heightmap, info.width, info.height);
+        let uniform_buffers = Self::create_uniform_buffers(&device, swap_chain_images.len(), &state);
 
         let previous_frame_end = Some(Self::create_sync_objects(&device));
 
         let mut app = Self {
             instance,
-            debug_callback,
+            _debug_callback,
 
             events_loop,
             surface,
@@ -223,6 +239,7 @@ impl HelloTriangleApplication {
             previous_frame_end,
             recreate_swap_chain: false,
 
+            state,
             start_time,
         };
 
@@ -541,15 +558,15 @@ impl HelloTriangleApplication {
         Arc::new(GraphicsPipeline::start()
             .vertex_input_single_buffer::<Vertex>()
             .vertex_shader(vert_shader_module.main_entry_point(), ())
-            .triangle_list()
-            .primitive_restart(false)
+            .triangle_strip()
+            .primitive_restart(true)
             .viewports(vec![ viewport ]) // NOTE: also sets scissor to cover whole viewport
             .fragment_shader(frag_shader_module.main_entry_point(), ())
             .depth_clamp(false)
             // NOTE: there's an outcommented .rasterizer_discard() in Vulkano...
             .polygon_mode_fill()
             .line_width(1.0)
-            // .cull_mode_back()
+            .cull_mode_back()
             .front_face_clockwise()
             // NOTE: no depth_bias here, but on pipeline::raster::Rasterization
             .blend_pass_through()
@@ -571,63 +588,77 @@ impl HelloTriangleApplication {
             .collect::<Vec<_>>()
     }
 
-    fn create_vertex_buffer(graphics_queue: &Arc<Queue>) -> Arc<dyn BufferAccess + Send + Sync> {
-        // CpuAccessibleBuffer::from_iter(device.clone(), BufferUsage::vertex_buffer(), vertices().iter().cloned()).unwrap()
+    // fn create_vertex_buffer(graphics_queue: &Arc<Queue>) -> Arc<dyn BufferAccess + Send + Sync> {
+    //     let (buffer, future) = ImmutableBuffer::from_iter(
+    //             vertices().iter().cloned(), BufferUsage::vertex_buffer(),
+    //             graphics_queue.clone())
+    //         .unwrap();
 
-        let (buffer, future) = ImmutableBuffer::from_iter(
-                vertices().iter().cloned(), BufferUsage::vertex_buffer(),
+    //     future.flush().unwrap();
+
+    //     buffer
+    // }
+
+    // fn create_index_buffer(graphics_queue: &Arc<Queue>) -> Arc<dyn TypedBufferAccess<Content=[u16]> + Send + Sync> {
+    //     let (buffer, future) = ImmutableBuffer::from_iter(
+    //             indices().iter().cloned(), BufferUsage::index_buffer(),
+    //             graphics_queue.clone())
+    //         .unwrap();
+
+    //     future.flush().unwrap();
+
+    //     buffer
+    // }
+
+    fn create_terrain(graphics_queue: &Arc<Queue>, heightmap: Vec<u16>, width: u32, height: u32) -> (Arc<dyn BufferAccess + Send + Sync>, Arc<dyn TypedBufferAccess<Content=[u32]> + Send + Sync>) {
+        let vertices = heightmap.iter().enumerate().map(|(idx, height)| {
+            let x = ((idx as u32 % width) as f32 / width as f32 - 0.5) * 7.0;
+            let y = ((idx as u32 / width) as f32 / width as f32 - 0.5) * 7.0;
+            Vertex::new([ x, y, *height as f32 / 65535.0 ], [ 0.1, 0.2, 0.0 ])
+        })
+        .collect::<Vec<_>>();
+
+        let indices = (1 .. height).flat_map(|y| {
+                (0 .. width).flat_map(move |x| {
+                    vec![
+                        (y - 1) * height + x,
+                        (y - 0) * height + x,
+                    ]
+                })
+                .chain([ u32::max_value() ].into_iter().cloned())
+            })
+            .collect::<Vec<_>>();
+
+        // let indices = [ 0, width, 1, width + 1 ];
+
+        dbg!(vertices[0]);
+        dbg!(vertices[width as usize]);
+        dbg!(vertices[1]);
+        dbg!(vertices[width as usize + 1]);
+
+        let (vertex_buffer, vertex_future) = ImmutableBuffer::from_iter(
+                vertices.iter().cloned(), BufferUsage::vertex_buffer(),
                 graphics_queue.clone())
             .unwrap();
 
-        future.flush().unwrap();
-
-        buffer
-    }
-
-    fn create_index_buffer(graphics_queue: &Arc<Queue>) -> Arc<dyn TypedBufferAccess<Content=[u16]> + Send + Sync> {
-        let (buffer, future) = ImmutableBuffer::from_iter(
-                indices().iter().cloned(), BufferUsage::index_buffer(),
+        let (index_buffer, index_future) = ImmutableBuffer::from_iter(
+                indices.iter().cloned(), BufferUsage::index_buffer(),
                 graphics_queue.clone())
             .unwrap();
 
-        future.flush().unwrap();
+        vertex_future.flush().unwrap();
+        index_future.flush().unwrap();
 
-        buffer
+        (vertex_buffer, index_buffer)
     }
 
-    fn create_uniform_buffers(
-        device: &Arc<Device>,
-        num_buffers: usize,
-        start_time: Instant,
-        dimensions_u32: [u32; 2],
-    ) -> Vec<Arc<CpuAccessibleBuffer<UniformBufferObject>>> {
-        let mut buffers = Vec::new();
+    fn create_state(dimensions: [u32; 2]) -> UniformBufferObject {
+        let dimensions = [ dimensions[0] as f32, dimensions[1] as f32 ];
 
-        let dimensions = [ dimensions_u32[0] as f32, dimensions_u32[1] as f32 ];
-
-        let uniform_buffer = Self::update_uniform_buffer(start_time, dimensions);
-
-        for _ in 0..num_buffers {
-            let buffer = CpuAccessibleBuffer::from_data(
-                device.clone(),
-                BufferUsage::uniform_buffer_transfer_destination(),
-                uniform_buffer,
-            ).unwrap();
-
-            buffers.push(buffer);
-        }
-
-        buffers
-    }
-
-    fn update_uniform_buffer(start_time: Instant, dimensions: [f32; 2]) -> UniformBufferObject {
-        let elapsed = start_time.elapsed();
-        let elapsed = (elapsed.as_secs() * 1000) + u64::from(elapsed.subsec_millis());
-
-        let model = Matrix4::from_angle_z(Rad::from(Deg(elapsed as f32 * 0.180)));
+        let model = Matrix4::from_angle_z(Rad(0.0));
 
         let view = Matrix4::look_at(
-            Point3::new(2.0, 2.0, 2.0),
+            Point3::new(2.0, 2.0, 1.0),
             Point3::new(0.0, 0.0, 0.0),
             Vector3::new(0.0, 0.0, 1.0),
         );
@@ -644,6 +675,27 @@ impl HelloTriangleApplication {
         UniformBufferObject {
             model, view, proj,
         }
+    }
+
+    fn create_uniform_buffers(device: &Arc<Device>, num_buffers: usize, state: &UniformBufferObject) -> Vec<Arc<CpuAccessibleBuffer<UniformBufferObject>>> {
+        let mut buffers = Vec::new();
+
+        for _ in 0..num_buffers {
+            let buffer = CpuAccessibleBuffer::from_data(
+                device.clone(),
+                BufferUsage::uniform_buffer_transfer_destination(),
+                state.clone(),
+            ).unwrap();
+
+            buffers.push(buffer);
+        }
+
+        buffers
+    }
+
+    fn update_uniform_buffer(&self, idx: usize) {
+        let mut buf = self.uniform_buffers[idx].write().unwrap();
+        *buf = self.state.clone();
     }
 
     fn create_command_buffers(&mut self) {
@@ -694,12 +746,23 @@ impl HelloTriangleApplication {
                 }
             });
 
+            self.update_state();
+
             self.draw_frame();
 
             if done {
                 return;
             }
         }
+    }
+
+    fn update_state(&mut self) {
+        let elapsed = self.start_time.elapsed();
+        let elapsed = (elapsed.as_secs() * 1000) + u64::from(elapsed.subsec_millis());
+
+        let model = Matrix4::from_angle_z(Rad::from(Deg(elapsed as f32 * 0.010)));
+
+        self.state.model = model;
     }
 
     fn draw_frame(&mut self) {
@@ -719,14 +782,7 @@ impl HelloTriangleApplication {
             Err(e) => panic!("{:?}", e),
         };
 
-        let elapsed = self.start_time.elapsed();
-        let elapsed = (elapsed.as_secs() * 1000) + u64::from(elapsed.subsec_millis());
-
-        {
-            let buffer = &self.uniform_buffers[image_index];
-            let mut bufobj = buffer.write().unwrap();
-            bufobj.model = Matrix4::from_angle_z(Rad::from(Deg(elapsed as f32 * 0.180)));
-        }
+        self.update_uniform_buffer(image_index);
 
         let command_buffer = self.command_buffers[image_index].clone();
 

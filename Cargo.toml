@@ -6,6 +6,8 @@ edition = "2018"
 
 [dependencies]
 cgmath          = "0.17.0"
+itertools       = "0.8.0"
+png             = "0.14.0"
 vulkano         = "0.11.1"
 vulkano-shaders = "0.11.1"
 vulkano-win     = "0.11.1"
