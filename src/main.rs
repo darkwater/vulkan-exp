@@ -3,7 +3,6 @@ use cgmath::Matrix4;
 use cgmath::Point3;
 use cgmath::Rad;
 use cgmath::Vector3;
-use itertools::Itertools;
 use png::HasParameters;
 use std::collections::HashSet;
 use std::fs::File;
@@ -28,6 +27,7 @@ use vulkano::framebuffer::Framebuffer;
 use vulkano::framebuffer::FramebufferAbstract;
 use vulkano::framebuffer::RenderPassAbstract;
 use vulkano::framebuffer::Subpass;
+use vulkano::image::AttachmentImage;
 use vulkano::image::ImageUsage;
 use vulkano::image::swapchain::SwapchainImage;
 use vulkano::impl_vertex;
@@ -94,19 +94,6 @@ impl Vertex {
             pos, color,
         }
     }
-}
-
-fn vertices() -> [Vertex; 4] {
-    [
-        Vertex::new([ -0.5, -0.5, 0.0 ], [ 0.24, 0.2, 0.0 ]),
-        Vertex::new([  0.5, -0.5, 0.0 ], [ 0.24, 0.2, 0.0 ]),
-        Vertex::new([  0.5,  0.5, 0.0 ], [ 0.24, 0.2, 0.0 ]),
-        Vertex::new([ -0.5,  0.5, 1.0 ], [ 0.24, 0.2, 0.0 ]),
-    ]
-}
-
-fn indices() -> [u32; 6] {
-    [ 0, 1, 3, 3, 2, 0 ]
 }
 
 #[derive(Clone)]
@@ -198,7 +185,7 @@ impl HelloTriangleApplication {
         let render_pass       = Self::create_render_pass(&device, swap_chain.format());
         let graphics_pipeline = Self::create_graphics_pipeline(&device, swap_chain.dimensions(), &render_pass);
 
-        let swap_chain_framebuffers = Self::create_framebuffers(&swap_chain_images, &render_pass);
+        let swap_chain_framebuffers = Self::create_framebuffers(&device, &swap_chain_images, &render_pass);
 
         let state = Self::create_state(swap_chain.dimensions());
         let start_time = Instant::now();
@@ -500,7 +487,7 @@ impl HelloTriangleApplication {
 
         self.render_pass             = Self::create_render_pass(&self.device, self.swap_chain.format());
         self.graphics_pipeline       = Self::create_graphics_pipeline(&self.device, self.swap_chain.dimensions(), &self.render_pass);
-        self.swap_chain_framebuffers = Self::create_framebuffers(&self.swap_chain_images, &self.render_pass);
+        self.swap_chain_framebuffers = Self::create_framebuffers(&self.device, &self.swap_chain_images, &self.render_pass);
 
         self.create_command_buffers();
     }
@@ -517,11 +504,17 @@ impl HelloTriangleApplication {
                     store: Store,
                     format: color_format,
                     samples: 1,
+                },
+                depth: {
+                    load: Clear,
+                    store: DontCare,
+                    format: Format::D32Sfloat,
+                    samples: 1,
                 }
             },
             pass: {
                 color: [ color ],
-                depth_stencil: {}
+                depth_stencil: { depth }
             }
         ).unwrap())
     }
@@ -570,50 +563,35 @@ impl HelloTriangleApplication {
             .front_face_clockwise()
             // NOTE: no depth_bias here, but on pipeline::raster::Rasterization
             .blend_pass_through()
+            .depth_stencil_simple_depth()
             .render_pass(Subpass::from(render_pass.clone(), 0).unwrap())
             .build(device.clone())
             .unwrap())
     }
 
     fn create_framebuffers(
+        device: &Arc<Device>,
         swap_chain_images: &[Arc<SwapchainImage<Window>>],
         render_pass: &Arc<dyn RenderPassAbstract + Send + Sync>
     ) -> Vec<Arc<dyn FramebufferAbstract + Send + Sync>> {
+        let dimensions = swap_chain_images[0].dimensions();
+
         swap_chain_images.iter()
             .map(|image| -> Arc<dyn FramebufferAbstract + Send + Sync> {
+                let depth_buffer = AttachmentImage::transient(device.clone(), dimensions, Format::D32Sfloat).unwrap();
+
                 Arc::new(Framebuffer::start(render_pass.clone())
                          .add(image.clone()).unwrap()
+                         .add(depth_buffer.clone()).unwrap()
                          .build().unwrap())
             })
             .collect::<Vec<_>>()
     }
 
-    // fn create_vertex_buffer(graphics_queue: &Arc<Queue>) -> Arc<dyn BufferAccess + Send + Sync> {
-    //     let (buffer, future) = ImmutableBuffer::from_iter(
-    //             vertices().iter().cloned(), BufferUsage::vertex_buffer(),
-    //             graphics_queue.clone())
-    //         .unwrap();
-
-    //     future.flush().unwrap();
-
-    //     buffer
-    // }
-
-    // fn create_index_buffer(graphics_queue: &Arc<Queue>) -> Arc<dyn TypedBufferAccess<Content=[u16]> + Send + Sync> {
-    //     let (buffer, future) = ImmutableBuffer::from_iter(
-    //             indices().iter().cloned(), BufferUsage::index_buffer(),
-    //             graphics_queue.clone())
-    //         .unwrap();
-
-    //     future.flush().unwrap();
-
-    //     buffer
-    // }
-
     fn create_terrain(graphics_queue: &Arc<Queue>, heightmap: Vec<u16>, width: u32, height: u32) -> (Arc<dyn BufferAccess + Send + Sync>, Arc<dyn TypedBufferAccess<Content=[u32]> + Send + Sync>) {
         let vertices = heightmap.iter().enumerate().map(|(idx, height)| {
-            let x = ((idx as u32 % width) as f32 / width as f32 - 0.5) * 7.0;
-            let y = ((idx as u32 / width) as f32 / width as f32 - 0.5) * 7.0;
+            let x = ((idx as u32 % width) as f32 / width as f32 - 0.5) * 10.0;
+            let y = ((idx as u32 / width) as f32 / width as f32 - 0.5) * 10.0;
             Vertex::new([ x, y, *height as f32 / 65535.0 ], [ 0.1, 0.2, 0.0 ])
         })
         .collect::<Vec<_>>();
@@ -628,13 +606,6 @@ impl HelloTriangleApplication {
                 .chain([ u32::max_value() ].into_iter().cloned())
             })
             .collect::<Vec<_>>();
-
-        // let indices = [ 0, width, 1, width + 1 ];
-
-        dbg!(vertices[0]);
-        dbg!(vertices[width as usize]);
-        dbg!(vertices[1]);
-        dbg!(vertices[width as usize + 1]);
 
         let (vertex_buffer, vertex_future) = ImmutableBuffer::from_iter(
                 vertices.iter().cloned(), BufferUsage::vertex_buffer(),
@@ -710,7 +681,7 @@ impl HelloTriangleApplication {
                 );
 
                 Arc::new(AutoCommandBufferBuilder::primary_simultaneous_use(self.device.clone(), queue_family).unwrap()
-                         .begin_render_pass(framebuffer.clone(), false, vec![ [ 0.0, 0.0, 0.0, 1.0 ].into() ]).unwrap()
+                         .begin_render_pass(framebuffer.clone(), false, vec![ [ 0.392, 0.584, 0.929, 1.0 ].into(), 1.0.into() ]).unwrap()
                          .draw_indexed(
                              self.graphics_pipeline.clone(),
                              &DynamicState::none(),
