@@ -629,7 +629,7 @@ impl HelloTriangleApplication {
         let model = Matrix4::from_angle_z(Rad(0.0));
 
         let view = Matrix4::look_at(
-            Point3::new(2.0, 2.0, 1.0),
+            Point3::new(2.0, 2.0, 1.5),
             Point3::new(0.0, 0.0, 0.0),
             Vector3::new(0.0, 0.0, 1.0),
         );
